@@ -13,18 +13,19 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 引入 Mutagen 音频处理库
+# Import Mutagen for audio metadata processing
 try:
     from mutagen.flac import FLAC, Picture
     from mutagen.mp3 import EasyMP3
     from mutagen.id3 import ID3, APIC
     from mutagen.mp4 import MP4, MP4Cover
+    from mutagen.oggvorbis import OggVorbis
 except ImportError:
-    messagebox.showerror("依赖缺失", "请先安装 mutagen 库: pip install mutagen")
+    messagebox.showerror("Missing Dependencies", "Please install mutagen: pip install mutagen")
     sys.exit(1)
 
 
-# ================= 配置管理器 =================
+# ================= Config Manager =================
 class ConfigManager:
     def __init__(self):
         self.config_file = "um_config.json"
@@ -58,7 +59,7 @@ class ConfigManager:
         return self.config.get(key, self.default_config.get(key, ""))
 
 
-# ================= 元数据处理器 =================
+# ================= Metadata Tagger =================
 class QQMusicTagger:
     def __init__(self, logger_func):
         self.log = logger_func
@@ -75,7 +76,7 @@ class QQMusicTagger:
             self.log("⚠️ 目录中未找到可处理的音频文件。")
             return
 
-        self.log(f"🎵 正在补全元数据，共 {len(files)} 个文件...")
+        self.log(f"🎵 正在执行初步处理与多阶段匹配，共 {len(files)} 个文件...")
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
@@ -91,7 +92,7 @@ class QQMusicTagger:
                     res, msg = future.result()
                     if res:
                         success_count += 1
-                        self.log(f"✅ [成功] {filename} -> {msg}")
+                        self.log(f"✅ [完成] {filename} -> {msg}")
                     else:
                         self.log(f"⚠️ [跳过] {filename} -> {msg}")
                 except Exception as e:
@@ -108,34 +109,59 @@ class QQMusicTagger:
             shutil.copy2(src_path, dst_path)
             work_path = dst_path
 
+        # 1. 提取文件名信息
+        f_artist, f_title = self._get_info_from_filename(filename)
+
+        # 2. 初步处理：读取原标签，若歌名不符则对齐，保留原专辑名
         local_title, local_artist, local_album = self._read_local_tags(work_path)
-        if not local_title or not local_album:
-            raw_artist, raw_title = self._get_info_from_filename(filename)
-            local_title = local_title or raw_title
-            local_artist = local_artist or raw_artist
-            local_album = local_album or "未知专辑"
 
-        album_meta = self._search_album(local_album, local_artist)
+        # 强制将标签歌名向文件名对齐 (只改歌曲名)
+        if local_title.lower().strip() != f_title.lower().strip():
+            self._write_single_tag(work_path, 'title', f_title)
+            local_title = f_title
+
+        # 3. 第一阶段：尝试使用“原专辑名”搜索
+        album_meta = None
+        if local_album.strip():
+            album_meta = self._search_with_album_filter(local_title, f_artist, local_album)
+
+        # 4. 第二阶段：如果第一阶段搜不到，使用“歌名 歌手”回退搜索并更新专辑名
         if not album_meta:
-            album_meta = self._search_song_fallback(local_title, local_artist)
-            if not album_meta: return False, "无法匹配云端信息"
+            album_meta = self._search_global(local_title, f_artist)
+            if album_meta:
+                self._write_single_tag(work_path, 'album', album_meta['albumname'])
 
+        if not album_meta:
+            return True, "已同步标题，但未搜到匹配专辑信息"
+
+        # 5. 获取音轨及写入完整元数据 (不再进行最后检查)
         track_index = self._find_track_index_in_album(album_meta['albummid'], local_title)
+
         patch_data = {
+            'title': local_title,
+            'artist': f_artist,
+            'album': album_meta['albumname'],
             'track': track_index,
-            'cover': f"https://y.qq.com/music/photo_new/T002R800x800M000{album_meta['albummid']}.jpg"
+            'cover_url': f"https://y.qq.com/music/photo_new/T002R800x800M000{album_meta['albummid']}.jpg"
         }
 
-        if self._write_patch_only(work_path, patch_data):
-            # 只有在不同文件夹且勾选了删除时才执行
+        if self._write_final_patch(work_path, patch_data):
             if not is_same_dir and delete_original:
                 try:
                     os.remove(src_path)
                 except:
                     pass
-            return True, f"已更新封面 & 音轨 #{track_index}"
+            return True, f"匹配专辑[{patch_data['album']}] (音轨:{track_index})"
 
-        return False, "元数据写入失败"
+        return False, "写入失败"
+
+    def _get_info_from_filename(self, filename):
+        name = os.path.splitext(filename)[0]
+        name = re.sub(r'(_EM|_HQ|_SQ|_24bit| - 副本)', '', name, flags=re.I).strip()
+        if " - " in name:
+            parts = name.split(" - ", 1)
+            return parts[0].strip(), parts[1].strip()
+        return "未知歌手", name
 
     def _read_local_tags(self, path):
         try:
@@ -156,42 +182,71 @@ class QQMusicTagger:
                 t = audio.get('\xa9nam', [""])[0];
                 r = audio.get('\xa9ART', [""])[0];
                 a = audio.get('\xa9alb', [""])[0]
-            return t, r, a
+            elif ext == '.ogg':
+                audio = OggVorbis(path)
+                t = audio.get('title', [""])[0];
+                r = audio.get('artist', [""])[0];
+                a = audio.get('album', [""])[0]
+            return str(t), str(r), str(a)
         except:
             return "", "", ""
 
-    def _get_info_from_filename(self, filename):
-        name = os.path.splitext(filename)[0]
-        name = re.sub(r'(_EM|_HQ|_SQ|_24bit)', '', name, flags=re.I)
-        if " - " in name:
-            parts = name.split(" - ", 1)
-            return parts[0].strip(), parts[1].strip()
-        return "", name.strip()
-
-    def _search_album(self, album_name, artist_name):
-        if not album_name or album_name == "未知专辑": return None
-        query = f"{artist_name} {album_name}" if artist_name else album_name
-        url = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp"
-        params = {"format": "json", "w": query, "n": 5, "t": 8}
+    def _write_single_tag(self, path, key, value):
         try:
-            res = requests.get(url, params=params, headers=self.headers, timeout=5).json()
-            albums = res.get('data', {}).get('album', {}).get('list', [])
-            if albums: return {'albummid': albums[0]['albumMID'], 'albumname': albums[0]['albumName']}
+            ext = os.path.splitext(path)[1].lower()
+            if ext == '.flac':
+                audio = FLAC(path);
+                audio[key] = value;
+                audio.save()
+            elif ext == '.mp3':
+                audio = EasyMP3(path);
+                audio[key] = value;
+                audio.save()
+            elif ext in ['.m4a', '.mp4']:
+                audio = MP4(path)
+                k = "\xa9nam" if key == 'title' else "\xa9ART" if key == 'artist' else "\xa9alb"
+                audio[k] = [value];
+                audio.save()
+            elif ext == '.ogg':
+                audio = OggVorbis(path);
+                audio[key] = value;
+                audio.save()
         except:
             pass
-        return None
 
-    def _search_song_fallback(self, title, artist):
-        query = f"{artist} {title}"
+    def _search_with_album_filter(self, title, artist, album):
+        """第一阶段：带专辑名过滤的精确搜索"""
         url = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp"
-        params = {"format": "json", "w": query, "n": 5}
+        params = {"format": "json", "w": f"{artist} {title} {album}", "n": 5}
         try:
             res = requests.get(url, params=params, headers=self.headers, timeout=5).json()
             songs = res.get('data', {}).get('song', {}).get('list', [])
-            if songs: return {'albummid': songs[0]['albummid'], 'albumname': songs[0]['albumname']}
+            for s in songs:
+                s_title = s['songname'].lower().strip()
+                s_album = s['albumname'].lower().strip()
+                # 歌名完全一致，且专辑名高度相似
+                if s_title == title.lower().strip():
+                    ratio = difflib.SequenceMatcher(None, s_album, album.lower().strip()).ratio()
+                    if ratio > 0.8:
+                        return {'albummid': s['albummid'], 'albumname': s['albumname']}
+            return None
         except:
-            pass
-        return None
+            return None
+
+    def _search_global(self, title, artist):
+        """第二阶段：全局回退搜索 (歌名+歌手)"""
+        url = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp"
+        params = {"format": "json", "w": f"{artist} {title}", "n": 10}
+        try:
+            res = requests.get(url, params=params, headers=self.headers, timeout=5).json()
+            songs = res.get('data', {}).get('song', {}).get('list', [])
+            for s in songs:
+                # 只要歌名一致，就采用第一个搜到的专辑
+                if s['songname'].lower().strip() == title.lower().strip():
+                    return {'albummid': s['albummid'], 'albumname': s['albumname']}
+            return None
+        except:
+            return None
 
     def _find_track_index_in_album(self, albummid, song_title):
         if albummid in self.album_cache:
@@ -207,21 +262,24 @@ class QQMusicTagger:
                 tracks = []
 
         for i, t in enumerate(tracks, 1):
-            if difflib.SequenceMatcher(None, song_title.lower(), t['songname'].lower()).ratio() > 0.8:
+            if t['songname'].lower().strip() == song_title.lower().strip():
                 return i
-        return 1
+        return 1  # 找不到则默认第1首
 
-    def _write_patch_only(self, path, patch):
+    def _write_final_patch(self, path, patch):
         try:
             ext = os.path.splitext(path)[1].lower()
             img_data = None
             try:
-                img_data = requests.get(patch['cover'], timeout=10).content
+                img_data = requests.get(patch['cover_url'], timeout=10).content
             except:
                 pass
 
             if ext == '.flac':
                 audio = FLAC(path)
+                audio['title'] = patch['title'];
+                audio['artist'] = patch['artist']
+                audio['album'] = patch['album'];
                 audio['tracknumber'] = str(patch['track'])
                 if img_data:
                     p = Picture();
@@ -233,23 +291,44 @@ class QQMusicTagger:
                 audio.save()
             elif ext == '.mp3':
                 audio = EasyMP3(path)
-                audio['tracknumber'] = str(patch['track']);
+                audio['title'] = patch['title'];
+                audio['artist'] = patch['artist']
+                audio['album'] = patch['album'];
+                audio['tracknumber'] = str(patch['track'])
                 audio.save()
                 if img_data:
-                    audio = ID3(path)
-                    audio.add(APIC(encoding=3, mime='image/jpeg', type=3, desc='Cover', data=img_data))
-                    audio.save()
+                    tags = ID3(path);
+                    tags.add(APIC(encoding=3, mime='image/jpeg', type=3, desc='Cover', data=img_data));
+                    tags.save()
             elif ext in ['.m4a', '.mp4']:
                 audio = MP4(path)
+                audio["\xa9nam"] = [patch['title']];
+                audio["\xa9ART"] = [patch['artist']]
+                audio["\xa9alb"] = [patch['album']];
                 audio["trkn"] = [(patch['track'], 0)]
-                if img_data: audio["covr"] = [MP4Cover(img_data, imageformat=MP4Cover.FORMAT_JPEG)]
+                if img_data:
+                    audio["covr"] = [MP4Cover(img_data, imageformat=MP4Cover.FORMAT_JPEG)]
+                audio.save()
+            elif ext == '.ogg':
+                audio = OggVorbis(path)
+                audio['title'] = patch['title'];
+                audio['artist'] = patch['artist']
+                audio['album'] = patch['album'];
+                audio['tracknumber'] = str(patch['track'])
+                if img_data:
+                    from base64 import b64encode
+                    p = Picture();
+                    p.data = img_data;
+                    p.type = 3;
+                    p.mime = "image/jpeg"
+                    audio["metadata_block_picture"] = [b64encode(p.write()).decode('ascii')]
                 audio.save()
             return True
         except:
             return False
 
 
-# ================= 后端逻辑 =================
+# ================= Logic Wrapper =================
 class BackendLogic:
     def __init__(self, logger_func):
         self.log = logger_func
@@ -282,7 +361,6 @@ class BackendLogic:
                 subprocess.run(cmd, startupinfo=startupinfo,
                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0, check=False)
 
-                # 解密页规则：同文件夹强制删加密文件，不同文件夹看开关
                 if is_same_dir or delete_src:
                     try:
                         os.remove(f_path)
@@ -294,8 +372,8 @@ class BackendLogic:
 
             self.log("✅ 解密已完成。")
             if auto_patch and self.running:
-                self.log("\n🚀 [自动补全] 正在请求云端数据...")
-                self.tagger.process_directory(output_dir, output_dir, False)  # 自动模式下不二次删除
+                self.log("\n🚀 [自动补全] 正在根据文件名对齐并匹配元数据...")
+                self.tagger.process_directory(output_dir, output_dir, False)
         except Exception as e:
             self.log(f"❌ 错误: {e}")
         finally:
@@ -311,7 +389,7 @@ class BackendLogic:
             self.running = False
 
 
-# ================= UI 布局 =================
+# ================= UI Layout =================
 class MusicApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -326,7 +404,7 @@ class MusicApp(ctk.CTk):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        # 1. 侧边栏
+        # Sidebar
         self.sidebar = ctk.CTkFrame(self, width=240, corner_radius=0)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
         self.sidebar.grid_rowconfigure(4, weight=1)
@@ -341,11 +419,11 @@ class MusicApp(ctk.CTk):
         self.um_entry.insert(0, self.config.get("um_path"))
         ctk.CTkButton(um_row, text="浏览", width=50, height=35, command=self.select_um_exe).pack(side="right")
 
-        self.info_label = ctk.CTkLabel(self.sidebar, text="Version 2.8\nby PAN", font=("Consolas", 11),
+        self.info_label = ctk.CTkLabel(self.sidebar, text="Version 4.6\nRefined Meta Matching", font=("Consolas", 11),
                                        text_color="gray")
         self.info_label.pack(side="bottom", pady=25)
 
-        # 2. 主体区域
+        # Main Area
         self.main_container = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
         self.main_container.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
         self.main_container.grid_rowconfigure(1, weight=1)
@@ -368,7 +446,7 @@ class MusicApp(ctk.CTk):
         self.tab_patch = self._create_patch_page()
         self.switch_tab("decrypt")
 
-        # 3. 日志
+        # Logbox
         self.log_box = ctk.CTkTextbox(self.main_container, height=220, font=("Consolas", 12), corner_radius=10)
         self.log_box.grid(row=2, column=0, sticky="ew", pady=(15, 0))
         self.log_box.configure(state="disabled")
@@ -381,14 +459,14 @@ class MusicApp(ctk.CTk):
         self.dec_output = self._create_path_row(page, "output_dir", "解密保存文件夹:")
 
         self.auto_patch_var = ctk.BooleanVar(value=self.config.get("auto_meta"))
-        ctk.CTkSwitch(page, text="解密后自动执行元数据补全", variable=self.auto_patch_var,
+        ctk.CTkSwitch(page, text="解密后启动“文件名对齐”补全", variable=self.auto_patch_var,
                       command=lambda: self.config.save_config("auto_meta", self.auto_patch_var.get())).pack(anchor="w",
                                                                                                             padx=25,
                                                                                                             pady=(
                                                                                                             15, 5))
 
         self.del_src_dec_var = ctk.BooleanVar(value=self.config.get("del_src_dec"))
-        ctk.CTkSwitch(page, text="完成后删除原始加密文件 (同文件夹时强制执行)", variable=self.del_src_dec_var,
+        ctk.CTkSwitch(page, text="解密后删除加密文件", variable=self.del_src_dec_var,
                       command=lambda: self.config.save_config("del_src_dec", self.del_src_dec_var.get())).pack(
             anchor="w", padx=25, pady=5)
 
@@ -399,18 +477,22 @@ class MusicApp(ctk.CTk):
 
     def _create_patch_page(self):
         page = ctk.CTkFrame(self.content_frame, fg_color="transparent")
-        ctk.CTkLabel(page, text="元数据补全", font=("微软雅黑", 20, "bold")).pack(anchor="w", padx=25, pady=(20, 10))
+        ctk.CTkLabel(page, text="元数据精确匹配 (初步对齐 + 阶梯搜索)", font=("微软雅黑", 20, "bold")).pack(anchor="w",
+                                                                                                            padx=25,
+                                                                                                            pady=(
+                                                                                                            20, 10))
 
-        self.patch_input = self._create_path_row(page, "patch_input_dir", "待补全文件夹 (初始):")
+        self.patch_input = self._create_path_row(page, "patch_input_dir", "音频文件夹 (初始):")
         self.patch_output = self._create_path_row(page, "patch_output_dir", "保存文件夹 (最终):")
 
         self.del_src_patch_var = ctk.BooleanVar(value=self.config.get("del_src_patch"))
-        ctk.CTkSwitch(page, text="移动至最终文件夹后删除原文件 (同文件夹时不生效)", variable=self.del_src_patch_var,
+        ctk.CTkSwitch(page, text="处理后删除原文件", variable=self.del_src_patch_var,
                       command=lambda: self.config.save_config("del_src_patch", self.del_src_patch_var.get())).pack(
             anchor="w", padx=25, pady=15)
 
-        self.btn_run_patch = ctk.CTkButton(page, text="✨ 开始补全云端信息", height=50, font=("微软雅黑", 16, "bold"),
-                                           fg_color="#2b719e", command=self.start_patch_only)
+        self.btn_run_patch = ctk.CTkButton(page, text="✨ 执行初步对齐与搜索补全", height=50,
+                                           font=("微软雅黑", 16, "bold"), fg_color="#2b719e",
+                                           command=self.start_patch_only)
         self.btn_run_patch.pack(padx=25, pady=25, fill="x")
         return page
 
@@ -427,14 +509,14 @@ class MusicApp(ctk.CTk):
 
     def switch_tab(self, name):
         if name == "decrypt":
-            self.tab_patch.pack_forget()
+            self.tab_patch.pack_forget();
             self.tab_decrypt.pack(fill="both", expand=True)
-            self.btn_tab_decrypt.configure(fg_color=["#3B8ED0", "#1F6AA5"])
+            self.btn_tab_decrypt.configure(fg_color=["#3B8ED0", "#1F6AA5"]);
             self.btn_tab_patch.configure(fg_color="gray")
         else:
-            self.tab_decrypt.pack_forget()
+            self.tab_decrypt.pack_forget();
             self.tab_patch.pack(fill="both", expand=True)
-            self.btn_tab_patch.configure(fg_color=["#3B8ED0", "#1F6AA5"])
+            self.btn_tab_patch.configure(fg_color=["#3B8ED0", "#1F6AA5"]);
             self.btn_tab_decrypt.configure(fg_color="gray")
 
     def select_folder(self, entry, key):
@@ -464,11 +546,11 @@ class MusicApp(ctk.CTk):
         threading.Thread(target=self._exec_dec, daemon=True).start()
 
     def _exec_dec(self):
-        self.btn_run_dec.configure(state="disabled", text="⚡ 正在处理...")
+        self.btn_run_dec.configure(state="disabled", text="Processing...")
         self.logic.run_decrypt(self.um_entry.get(), self.dec_input.get(), self.dec_output.get(),
                                self.auto_patch_var.get(), self.del_src_dec_var.get())
         self.btn_run_dec.configure(state="normal", text="🔥 开始执行解密任务")
-        messagebox.showinfo("完成", "任务流已结束")
+        messagebox.showinfo("Success", "Task complete. Variants distinguished by exact matching.")
 
     def start_patch_only(self):
         self.log_box.configure(state="normal");
@@ -477,10 +559,10 @@ class MusicApp(ctk.CTk):
         threading.Thread(target=self._exec_patch, daemon=True).start()
 
     def _exec_patch(self):
-        self.btn_run_patch.configure(state="disabled", text="⚡ 联机补全中...")
+        self.btn_run_patch.configure(state="disabled", text="Matching...")
         self.logic.run_patch_only(self.patch_input.get(), self.patch_output.get(), self.del_src_patch_var.get())
-        self.btn_run_patch.configure(state="normal", text="✨ 开始补全云端信息")
-        messagebox.showinfo("完成", "云端信息补全完毕")
+        self.btn_run_patch.configure(state="normal", text="✨ 执行初步对齐与搜索补全")
+        messagebox.showinfo("Success", "Fixed: Titles locked via exact matching logic.")
 
 
 if __name__ == "__main__":
