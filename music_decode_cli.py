@@ -6,6 +6,8 @@ import threading
 import subprocess
 import shutil
 import requests
+import re
+import difflib
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
@@ -53,7 +55,7 @@ class ConfigManager:
         return self.config.get(key, "")
 
 
-# ================= QQ音乐元数据处理器 (Python版) =================
+# ================= 优化版元数据处理器 (仅补全封面和音轨) =================
 class QQMusicTagger:
     def __init__(self, logger_func):
         self.log = logger_func
@@ -62,16 +64,15 @@ class QQMusicTagger:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
         self.album_cache = {}
-        self.cover_cache = {}
-        self.metadata_cache = {}
 
     def process_directory(self, directory):
-        files = [f for f in os.listdir(directory) if f.lower().endswith(('.mp3', '.flac', '.m4a', '.ogg'))]
+        valid_exts = ('.mp3', '.flac', '.m4a', '.ogg')
+        files = [f for f in os.listdir(directory) if f.lower().endswith(valid_exts)]
         if not files:
-            self.log("⚠️ 目录中未找到音频文件，跳过标签处理。")
+            self.log("⚠️ 目录中未找到解密后的音乐文件。")
             return
 
-        self.log(f"🎵 开始执行 Python 元数据补全，共 {len(files)} 个文件...")
+        self.log(f"🎵 正在精准补全封面与音轨号 (#)，共 {len(files)} 个文件...")
 
         success_count = 0
         with ThreadPoolExecutor(max_workers=5) as executor:
@@ -83,362 +84,290 @@ class QQMusicTagger:
                     res, msg = future.result()
                     if res:
                         success_count += 1
-                        self.log(f"✅ [Tag] {filename} -> {msg}")
+                        self.log(f"✅ [补全成功] {filename} -> {msg}")
                     else:
-                        self.log(f"⚠️ [Tag] {filename} -> {msg}")
+                        self.log(f"⚠️ [跳过] {filename} -> {msg}")
                 except Exception as e:
-                    self.log(f"❌ [Tag] {filename} 异常: {e}")
+                    self.log(f"❌ [异常] {filename}: {e}")
 
-        self.log(f"📊 元数据处理完成：成功 {success_count}/{len(files)}")
+        self.log(f"📊 补全任务结束：成功 {success_count}/{len(files)}")
 
     def _process_single(self, filename, directory):
         filepath = os.path.join(directory, filename)
 
-        # 1. 提取基础信息
-        artist, title = self._get_local_info(filepath)
-        query = f"{artist} {title}".strip()
-        if not query:
-            query = os.path.splitext(filename)[0]
+        # 1. 仅读取本地现有的标题和专辑名，用于云端匹配
+        local_title, local_artist, local_album = self._read_local_tags(filepath)
 
-        # 2. 搜API
-        meta = self._search_api(query)
-        if not meta:
-            return False, "未找到歌曲信息"
+        # 即使读不到也尝试从文件名解析，保证搜索能进行
+        if not local_title or not local_album:
+            raw_artist, raw_title = self._get_info_from_filename(filename)
+            local_title = local_title or raw_title
+            local_artist = local_artist or raw_artist
+            local_album = local_album or "未知专辑"
 
-        # 3. 补轨道号
-        meta['track'] = self._get_track_num(meta)
+        # 2. 搜索专辑以获取 albummid
+        album_meta = self._search_album(local_album, local_artist)
+        if not album_meta:
+            # 备选：按歌曲搜获取专辑信息
+            album_meta = self._search_song_fallback(local_title, local_artist)
+            if not album_meta: return False, "云端匹配失败"
 
-        # 4. 写标签
-        if self._write_tags(filepath, meta):
-            return True, f"{meta['title']} - {meta['artist']}"
+        # 3. 在专辑中查找本首歌的音轨号 (#)
+        track_index = self._find_track_index_in_album(album_meta['albummid'], local_title)
+
+        # 4. 构造补全数据：仅包含封面 URL 和音轨号
+        patch_data = {
+            'track': track_index,
+            'cover': f"https://y.qq.com/music/photo_new/T002R800x800M000{album_meta['albummid']}.jpg"
+        }
+
+        # 5. 写入（仅写入封面和音轨）
+        if self._write_patch_only(filepath, patch_data):
+            return True, f"已补全封面 & 音轨 #{track_index}"
         return False, "写入失败"
 
-    def _get_local_info(self, path):
-        # 简易提取：优先读文件名，因为刚解密的文件标签可能为空
-        base = os.path.basename(path)
-        name, _ = os.path.splitext(base)
+    def _read_local_tags(self, path):
+        try:
+            ext = os.path.splitext(path)[1].lower()
+            t, r, a = "", "", ""
+            if ext == '.flac':
+                audio = FLAC(path)
+                t = audio.get('title', [""])[0]
+                r = audio.get('artist', [""])[0]
+                a = audio.get('album', [""])[0]
+            elif ext == '.mp3':
+                audio = EasyMP3(path)
+                t = audio.get('title', [""])[0]
+                r = audio.get('artist', [""])[0]
+                a = audio.get('album', [""])[0]
+            elif ext in ['.m4a', '.mp4']:
+                audio = MP4(path)
+                t = audio.get('\xa9nam', [""])[0]
+                r = audio.get('\xa9ART', [""])[0]
+                a = audio.get('\xa9alb', [""])[0]
+            return t, r, a
+        except:
+            return "", "", ""
+
+    def _get_info_from_filename(self, filename):
+        name = os.path.splitext(filename)[0]
+        name = re.sub(r'(_EM|_HQ|_SQ|_24bit)', '', name, flags=re.I)
         if " - " in name:
-            p = name.split(" - ", 1)
-            return p[0].strip(), p[1].strip()
+            parts = name.split(" - ", 1)
+            return parts[0].strip(), parts[1].strip()
         return "", name.strip()
 
-    def _search_api(self, query):
-        if query in self.metadata_cache: return self.metadata_cache[query]
-
-        url = f"https://c.y.qq.com/soso/fcgi-bin/client_search_cp?format=json&w={query}&n=1"
+    def _search_album(self, album_name, artist_name):
+        if not album_name or album_name == "未知专辑": return None
+        query = f"{artist_name} {album_name}" if artist_name else album_name
+        url = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp"
+        params = {"format": "json", "w": query, "n": 5, "t": 8}  # t=8 搜专辑
         try:
-            res = requests.get(url, headers=self.headers, timeout=5).json()
-            if not res['data']['song']['list']:
-                return None
-            song = res['data']['song']['list'][0]
-
-            # 获取封面
-            mid = song['albummid']
-            cover = ""
-            if mid not in self.cover_cache:
-                for s in ["800", "500", "300"]:
-                    u = f"https://y.qq.com/music/photo_new/T002R{s}x{s}M000{mid}.jpg"
-                    try:
-                        h = requests.head(u, timeout=3)
-                        if h.status_code == 200 and int(h.headers.get('content-length', 0)) > 5000:
-                            cover = u;
-                            self.cover_cache[mid] = u;
-                            break
-                    except:
-                        continue
-            else:
-                cover = self.cover_cache[mid]
-
-            data = {
-                'title': song['songname'],
-                'artist': song['singer'][0]['name'],
-                'album': song['albumname'],
-                'albummid': mid,
-                'songmid': song['songmid'],
-                'cover': cover
-            }
-            self.metadata_cache[query] = data
-            return data
+            res = requests.get(url, params=params, headers=self.headers, timeout=5).json()
+            albums = res.get('data', {}).get('album', {}).get('list', [])
+            if albums:
+                return {'albummid': albums[0]['albumMID'], 'albumname': albums[0]['albumName']}
         except:
-            return None
+            pass
+        return None
 
-    def _get_track_num(self, meta):
-        mid = meta['albummid']
-        if mid in self.album_cache:
-            tracks = self.album_cache[mid]
+    def _search_song_fallback(self, title, artist):
+        query = f"{artist} {title}"
+        url = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp"
+        params = {"format": "json", "w": query, "n": 5}
+        try:
+            res = requests.get(url, params=params, headers=self.headers, timeout=5).json()
+            songs = res.get('data', {}).get('song', {}).get('list', [])
+            if songs:
+                return {'albummid': songs[0]['albummid'], 'albumname': songs[0]['albumname']}
+        except:
+            pass
+        return None
+
+    def _find_track_index_in_album(self, albummid, song_title):
+        if albummid in self.album_cache:
+            tracks = self.album_cache[albummid]
         else:
             try:
-                u = f"https://c.y.qq.com/v8/fcg-bin/fcg_v8_album_info_cp.fcg?albummid={mid}&format=json"
-                res = requests.get(u, headers=self.headers, timeout=5).json()
-                tracks = res['data']['list']
-                self.album_cache[mid] = tracks
+                url = "https://c.y.qq.com/v8/fcg-bin/fcg_v8_album_info_cp.fcg"
+                res = requests.get(url, params={"albummid": albummid, "format": "json"}, headers=self.headers,
+                                   timeout=5).json()
+                tracks = res.get('data', {}).get('list', [])
+                self.album_cache[albummid] = tracks
             except:
                 tracks = []
 
         for i, t in enumerate(tracks, 1):
-            if t['songmid'] == meta['songmid']: return i
+            if difflib.SequenceMatcher(None, song_title.lower(), t['songname'].lower()).ratio() > 0.8:
+                return i
         return 1
 
-    def _write_tags(self, path, meta):
+    def _write_patch_only(self, path, patch):
+        """核心修改：只写入音轨号和封面，不改动标题、歌手、专辑名"""
         try:
             ext = os.path.splitext(path)[1].lower()
             img_data = None
-            if meta['cover']:
-                try:
-                    img_data = requests.get(meta['cover'], timeout=10).content
-                except:
-                    pass
+            try:
+                img_data = requests.get(patch['cover'], timeout=10).content
+            except:
+                pass
 
             if ext == '.flac':
                 audio = FLAC(path)
-                audio['title'] = meta['title']
-                audio['artist'] = meta['artist']
-                audio['album'] = meta['album']
-                audio['tracknumber'] = str(meta['track'])
-                audio['comment'] = "Processed by 𝗣𝗔𝗡"
+                # 仅写音轨
+                audio['tracknumber'] = str(patch['track'])
+                # 仅写封面
                 if img_data:
-                    p = Picture()
-                    p.data = img_data
-                    p.type = 3
+                    p = Picture();
+                    p.data = img_data;
+                    p.type = 3;
                     p.mime = "image/jpeg"
-                    audio.clear_pictures()
+                    audio.clear_pictures();
                     audio.add_picture(p)
                 audio.save()
-
             elif ext == '.mp3':
-                # 先用EasyMP3写文本
-                try:
-                    audio = EasyMP3(path)
-                except:
-                    audio = EasyMP3(path)  # 重试或用ID3
-
-                audio['title'] = meta['title']
-                audio['artist'] = meta['artist']
-                audio['album'] = meta['album']
-                audio['tracknumber'] = str(meta['track'])
+                # 仅写音轨
+                audio = EasyMP3(path)
+                audio['tracknumber'] = str(patch['track'])
                 audio.save()
-
-                # 再用ID3写封面
+                # 仅写封面
                 if img_data:
                     audio = ID3(path)
                     audio.add(APIC(encoding=3, mime='image/jpeg', type=3, desc='Cover', data=img_data))
                     audio.save()
-
             elif ext in ['.m4a', '.mp4']:
                 audio = MP4(path)
-                audio["\xa9nam"] = meta['title']
-                audio["\xa9ART"] = meta['artist']
-                audio["\xa9alb"] = meta['album']
-                audio["trkn"] = [(meta['track'], 0)]
+                # 仅写音轨 (trkn 格式为 [(index, total)])
+                audio["trkn"] = [(patch['track'], 0)]
+                # 仅写封面
                 if img_data:
                     audio["covr"] = [MP4Cover(img_data, imageformat=MP4Cover.FORMAT_JPEG)]
                 audio.save()
-
             return True
-        except Exception as e:
-            # print(e)
+        except:
             return False
 
 
-# ================= 后端逻辑 (整合版) =================
+# ================= 后端逻辑 =================
 class BackendLogic:
     def __init__(self, logger_func):
         self.log = logger_func
         self.running = False
-        self.process = None
         self.tagger = QQMusicTagger(logger_func)
 
     def run_task(self, um_path, input_dir, output_dir, auto_meta):
         if not os.path.exists(um_path):
-            self.log("❌ 错误：未找到 um.exe")
+            self.log("❌ 找不到 um.exe")
             return
-        if not os.path.exists(input_dir):
-            self.log("❌ 错误：输入目录不存在")
-            return
-
         self.running = True
-
-        # --- 阶段 1: 使用 um.exe 解密 ---
         try:
             os.makedirs(output_dir, exist_ok=True)
-            self.log("🚀 [Phase 1] 启动 um.exe 进行解密...")
+            self.log("🚀 [Phase 1] 正在解密文件...")
+            audio_exts = ('.mflac', '.mgg', '.mmp4', '.qmc', '.kgm', '.vpr', '.ncm')
+            all_files = [f for f in os.listdir(input_dir) if f.lower().endswith(audio_exts)]
 
-            # 不使用 --update-metadata，因为我们后面要自己跑
-            cmd = [um_path, '-i', input_dir, '-o', output_dir, '--overwrite']
+            for f in all_files:
+                if not self.running: break
+                f_path = os.path.join(input_dir, f)
+                cmd = [um_path, '-i', f_path, '-o', output_dir, '--overwrite']
+                startupinfo = None
+                if os.name == 'nt':
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                subprocess.run(cmd, startupinfo=startupinfo,
+                               creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0, check=False)
 
-            # Windows 隐藏窗口设置
-            startupinfo = None
-            if os.name == 'nt':
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
-            self.process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                startupinfo=startupinfo,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            )
-
-            while self.running:
-                line = self.process.stdout.readline()
-                if not line and self.process.poll() is not None:
-                    break
-                if line and line.strip():
-                    self.log(f"CLI > {line.strip()}")
-
-            if self.process.poll() != 0:
-                self.log("⚠️ 解密过程可能存在错误，请检查日志。")
-            else:
-                self.log("✅ 解密完成。")
-
-        except Exception as e:
-            self.log(f"❌ 解密阶段发生错误: {e}")
-            self.running = False
-            return
-
-        # --- 阶段 2: 使用 Python 补全元数据 ---
-        if self.running and auto_meta:
-            self.log("\n🚀 [Phase 2] 启动 Python 脚本补全元数据 (QQ音乐源)...")
-            try:
+            self.log("✅ 解密完成。")
+            if auto_meta and self.running:
+                self.log("\n🚀 [Phase 2] 正在检索云端信息并补全封面与音轨号 (#)...")
                 self.tagger.process_directory(output_dir)
-            except Exception as e:
-                self.log(f"❌ 元数据处理阶段错误: {e}")
+        except Exception as e:
+            self.log(f"❌ 运行异常: {e}")
+        finally:
+            self.running = False
 
-        self.running = False
 
-
-# ================= 前端 UI (CustomTkinter) =================
+# ================= UI 布局 =================
 class MusicApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.config = ConfigManager()
         self.logic = BackendLogic(self.log)
-
-        # 窗口设置
-        self.title("Unlock Music GUI (Pro)")
-        self.geometry("850x650")
+        self.title("Unlock Music GUI (封面 & 音轨补全版)")
+        self.geometry("900x700")
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("blue")
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        # 侧边栏
         self.sidebar = ctk.CTkFrame(self, width=200, corner_radius=0)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
-        self.sidebar.grid_rowconfigure(4, weight=1)
-
-        ctk.CTkLabel(self.sidebar, text="⚙️ 设置", font=("微软雅黑", 20, "bold")).grid(row=0, column=0, padx=20,
-                                                                                       pady=20)
-
-        ctk.CTkLabel(self.sidebar, text="核心程序 (um.exe):", anchor="w").grid(row=1, column=0, padx=20, pady=(10, 0),
-                                                                               sticky="w")
-        self.um_entry = ctk.CTkEntry(self.sidebar)
-        self.um_entry.grid(row=2, column=0, padx=20, pady=(0, 10), sticky="ew")
+        ctk.CTkLabel(self.sidebar, text="⚙️ 设置", font=("微软雅黑", 20, "bold")).pack(pady=20)
+        self.um_entry = ctk.CTkEntry(self.sidebar);
+        self.um_entry.pack(padx=20, pady=5, fill="x")
         self.um_entry.insert(0, self.config.get("um_path"))
-        ctk.CTkButton(self.sidebar, text="浏览...", command=self.select_um_exe, fg_color="#444").grid(row=3, column=0,
-                                                                                                      padx=20, pady=10)
+        ctk.CTkButton(self.sidebar, text="选择 um.exe", command=self.select_um_exe).pack(pady=10)
 
-        ctk.CTkLabel(self.sidebar, text="Powered by Unlock Music\nMetadata by QQMusic Api", text_color="gray",
-                     font=("Arial", 10)).grid(row=5, column=0, padx=20, pady=20)
-
-        # 主内容
         self.main_area = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
-        self.main_area.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
+        self.main_area.grid(row=0, column=1, sticky="nsew", padx=25, pady=25)
+        ctk.CTkLabel(self.main_area, text="🎼 封面与音轨批量补全工具", font=("微软雅黑", 24, "bold")).pack(anchor="w",
+                                                                                                          pady=(0, 20))
 
-        ctk.CTkLabel(self.main_area, text="🎧 音乐解密 & 智能整理", font=("微软雅黑", 22, "bold")).pack(anchor="w",
-                                                                                                       pady=(0, 20))
-
-        # 路径选择
         self.path_frame = ctk.CTkFrame(self.main_area)
         self.path_frame.pack(fill="x", pady=10)
-
-        ctk.CTkLabel(self.path_frame, text="加密源目录:").pack(anchor="w", padx=15, pady=(15, 5))
-        self.input_entry = self._create_path_selector(self.path_frame, "input_dir")
-
-        ctk.CTkLabel(self.path_frame, text="输出目录:").pack(anchor="w", padx=15, pady=(10, 5))
-        self.output_entry = self._create_path_selector(self.path_frame, "output_dir")
-
-        # 选项
-        self.opt_frame = ctk.CTkFrame(self.main_area, fg_color="transparent")
-        self.opt_frame.pack(fill="x", pady=10)
+        self.input_entry = self._create_path_selector(self.path_frame, "input_dir", "加密文件目录:")
+        self.output_entry = self._create_path_selector(self.path_frame, "output_dir", "解密输出目录:")
 
         self.check_meta_var = ctk.BooleanVar(value=self.config.get("auto_meta"))
-        self.check_meta = ctk.CTkSwitch(self.opt_frame, text="启用自动补全元数据 (使用 Python 爬虫逻辑)",
-                                        variable=self.check_meta_var,
-                                        command=lambda: self.config.save_config("auto_meta", self.check_meta_var.get()),
-                                        progress_color="#2CC985")
-        self.check_meta.pack(side="left")
+        ctk.CTkSwitch(self.main_area, text="仅补全封面与音轨 (保留原始标题/歌手/专辑名)", variable=self.check_meta_var,
+                      command=lambda: self.config.save_config("auto_meta", self.check_meta_var.get())).pack(pady=15)
 
-        # 运行按钮
-        self.btn_run = ctk.CTkButton(self.main_area, text="🚀 开始处理", height=50, font=("微软雅黑", 16, "bold"),
+        self.btn_run = ctk.CTkButton(self.main_area, text="🚀 开始任务", height=50, font=("微软雅黑", 18, "bold"),
                                      command=self.start_process)
-        self.btn_run.pack(pady=20, fill="x")
+        self.btn_run.pack(pady=10, fill="x")
 
-        # 日志
-        self.log_box = ctk.CTkTextbox(self.main_area, height=180, font=("Consolas", 11))
-        self.log_box.pack(fill="both", expand=True, pady=(5, 0))
+        self.log_box = ctk.CTkTextbox(self.main_area, height=350, font=("Consolas", 11))
+        self.log_box.pack(fill="both", expand=True, pady=10)
         self.log_box.configure(state="disabled")
 
-    def _create_path_selector(self, parent, config_key):
+    def _create_path_selector(self, parent, config_key, label):
+        ctk.CTkLabel(parent, text=label).pack(anchor="w", padx=15, pady=(10, 0))
         container = ctk.CTkFrame(parent, fg_color="transparent")
-        container.pack(fill="x", padx=15, pady=(0, 15))
-        entry = ctk.CTkEntry(container)
+        container.pack(fill="x", padx=15, pady=(0, 10))
+        entry = ctk.CTkEntry(container);
         entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
         entry.insert(0, self.config.get(config_key))
-        btn = ctk.CTkButton(container, text="📂", width=40, command=lambda: self.select_folder(entry, config_key))
-        btn.pack(side="right")
+        ctk.CTkButton(container, text="📂", width=45, command=lambda: self.select_folder(entry, config_key)).pack(
+            side="right")
         return entry
 
     def select_folder(self, entry, key):
         path = filedialog.askdirectory()
-        if path:
-            entry.delete(0, "end");
-            entry.insert(0, path)
-            self.config.save_config(key, path)
+        if path: entry.delete(0, "end"); entry.insert(0, path); self.config.save_config(key, path)
 
     def select_um_exe(self):
-        path = filedialog.askopenfilename(filetypes=[("Executable", "um.exe"), ("All", "*.exe")])
-        if path:
-            self.um_entry.delete(0, "end");
-            self.um_entry.insert(0, path)
-            self.config.save_config("um_path", path)
+        path = filedialog.askopenfilename()
+        if path: self.um_entry.delete(0, "end"); self.um_entry.insert(0, path); self.config.save_config("um_path", path)
 
     def log(self, msg):
-        self.log_box.configure(state="normal")
-        self.log_box.insert("end", f"{msg}\n")
-        self.log_box.see("end")
+        self.log_box.configure(state="normal");
+        self.log_box.insert("end", f"{msg}\n");
+        self.log_box.see("end");
         self.log_box.configure(state="disabled")
-
-    def toggle_ui(self, enable):
-        state = "normal" if enable else "disabled"
-        self.btn_run.configure(state=state, text="🚀 开始处理" if enable else "⏳ 运行中...")
 
     def start_process(self):
-        um = self.um_entry.get()
-        inp = self.input_entry.get()
-        out = self.output_entry.get()
-        meta = self.check_meta_var.get()
-
-        if not um or not inp or not out:
-            messagebox.showerror("参数错误", "请检查路径设置")
-            return
-
-        self.toggle_ui(False)
-        self.log_box.configure(state="normal")
-        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="normal");
+        self.log_box.delete("1.0", "end");
         self.log_box.configure(state="disabled")
+        threading.Thread(target=self._run_thread, daemon=True).start()
 
-        threading.Thread(target=self._run_thread, args=(um, inp, out, meta), daemon=True).start()
-
-    def _run_thread(self, um, inp, out, meta):
-        self.logic.run_task(um, inp, out, meta)
-        self.after(0, lambda: self.toggle_ui(True))
-        self.after(0, lambda: messagebox.showinfo("完成", "处理流程结束！"))
+    def _run_thread(self):
+        self.btn_run.configure(state="disabled", text="⚡ 正在补全中...")
+        self.logic.run_task(self.um_entry.get(), self.input_entry.get(), self.output_entry.get(),
+                            self.check_meta_var.get())
+        self.btn_run.configure(state="normal", text="🚀 开始任务")
+        messagebox.showinfo("完成", "任务结束，已成功补全缺失的封面与音轨号。")
 
 
 if __name__ == "__main__":
